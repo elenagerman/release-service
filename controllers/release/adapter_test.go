@@ -17,6 +17,7 @@ limitations under the License.
 package release
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -44,6 +45,7 @@ import (
 	ecapiv1alpha1 "github.com/conforma/crds/api/v1alpha1"
 	applicationapiv1alpha1 "github.com/konflux-ci/application-api/api/v1alpha1"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -51,7 +53,20 @@ import (
 	"knative.dev/pkg/apis"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+type pipelineRunCreateDenyClient struct {
+	client.Client
+	err error
+}
+
+func (c *pipelineRunCreateDenyClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if _, isPipelineRun := obj.(*tektonv1.PipelineRun); isPipelineRun {
+		return c.err
+	}
+	return c.Client.Create(ctx, obj, opts...)
+}
 
 var _ = Describe("Release adapter", Ordered, func() {
 	var (
@@ -511,6 +526,43 @@ var _ = Describe("Release adapter", Ordered, func() {
 			Expect(pipelineRun).NotTo(BeNil())
 			Expect(err).NotTo(HaveOccurred())
 			Expect(adapter.client.Delete(adapter.ctx, pipelineRun)).To(Succeed())
+		})
+
+		It("should not requeue and should surface non-retriable PipelineRun create errors in release status", func() {
+			adapter.ctx = toolkit.GetMockedContext(ctx, []toolkit.MockData{
+				{
+					ContextKey: loader.ProcessingResourcesContextKey,
+					Resource: &loader.ProcessingResources{
+						EnterpriseContractConfigMap: enterpriseContractConfigMap,
+						EnterpriseContractPolicy:    enterpriseContractPolicy,
+						ReleasePlan:                 releasePlan,
+						ReleasePlanAdmission:        releasePlanAdmission,
+						Snapshot:                    snapshot,
+					},
+				},
+				{
+					ContextKey: loader.RoleBindingContextKey,
+					Resource:   roleBinding,
+				},
+			})
+			adapter.release.MarkReleasing("")
+			adapter.release.MarkTenantPipelineProcessingSkipped()
+			admissionErr := errors.NewBadRequest(`admission webhook "pipelinerun-kueue-defaulter.tekton-kueue.io" denied the request: invalid value`)
+			adapter.client = &pipelineRunCreateDenyClient{
+				Client: adapter.client,
+				err:    admissionErr,
+			}
+
+			result, err := adapter.EnsureManagedPipelineIsProcessed()
+			Expect(!result.RequeueRequest && !result.CancelRequest).To(BeTrue())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(adapter.release.HasReleaseFinished()).To(BeTrue())
+			Expect(adapter.release.IsFailed()).To(BeTrue())
+
+			releasedCondition := meta.FindStatusCondition(adapter.release.Status.Conditions, "Released")
+			Expect(releasedCondition).NotTo(BeNil())
+			Expect(releasedCondition.Message).To(ContainSubstring("Failed to create managed PipelineRun"))
+			Expect(releasedCondition.Message).To(ContainSubstring("admission webhook"))
 		})
 	})
 
@@ -6000,6 +6052,23 @@ var _ = Describe("Release adapter", Ordered, func() {
 			result, err := adapter.getFailedTaskRunLogs(pipelineRun)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result).To(BeEmpty())
+		})
+	})
+
+	When("isNonRetriablePipelineRunCreationError is called", func() {
+		It("should return true for admission webhook denials", func() {
+			err := errors.NewBadRequest(`admission webhook "pipelinerun-kueue-defaulter.tekton-kueue.io" denied the request`)
+			Expect(isNonRetriablePipelineRunCreationError(err)).To(BeTrue())
+		})
+
+		It("should return true for invalid request errors", func() {
+			err := errors.NewInvalid(schema.GroupKind{Group: "tekton.dev", Kind: "PipelineRun"}, "test", nil)
+			Expect(isNonRetriablePipelineRunCreationError(err)).To(BeTrue())
+		})
+
+		It("should return false for retriable errors", func() {
+			err := errors.NewConflict(schema.GroupResource{Group: "tekton.dev", Resource: "pipelineruns"}, "test", fmt.Errorf("conflict"))
+			Expect(isNonRetriablePipelineRunCreationError(err)).To(BeFalse())
 		})
 	})
 

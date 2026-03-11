@@ -277,6 +277,9 @@ func (a *adapter) EnsureManagedCollectorsPipelineIsProcessed() (controller.Opera
 
 			pipelineRun, err = a.createManagedCollectorsPipelineRun(releasePlanAdmission)
 			if err != nil {
+				if result, handledErr, handled := a.handlePipelineRunCreationError(err, metadata.ManagedCollectorsPipelineType); handled {
+					return result, handledErr
+				}
 				return controller.RequeueWithError(err)
 			}
 
@@ -371,6 +374,9 @@ func (a *adapter) EnsureTenantCollectorsPipelineIsProcessed() (controller.Operat
 
 			pipelineRun, err = a.createTenantCollectorsPipelineRun(releasePlan, releasePlanAdmission)
 			if err != nil {
+				if result, handledErr, handled := a.handlePipelineRunCreationError(err, metadata.TenantCollectorsPipelineType); handled {
+					return result, handledErr
+				}
 				return controller.RequeueWithError(err)
 			}
 
@@ -445,6 +451,9 @@ func (a *adapter) EnsureTenantPipelineIsProcessed() (controller.OperationResult,
 
 			pipelineRun, err = a.createTenantPipelineRun(releasePlan, snapshot)
 			if err != nil {
+				if result, handledErr, handled := a.handlePipelineRunCreationError(err, metadata.TenantPipelineType); handled {
+					return result, handledErr
+				}
 				return controller.RequeueWithError(err)
 			}
 
@@ -514,6 +523,9 @@ func (a *adapter) EnsureManagedPipelineIsProcessed() (controller.OperationResult
 
 			pipelineRun, err = a.createManagedPipelineRun(resources)
 			if err != nil {
+				if result, handledErr, handled := a.handlePipelineRunCreationError(err, metadata.ManagedPipelineType); handled {
+					return result, handledErr
+				}
 				return controller.RequeueWithError(err)
 			}
 
@@ -560,6 +572,9 @@ func (a *adapter) EnsureFinalPipelineIsProcessed() (controller.OperationResult, 
 
 			pipelineRun, err = a.createFinalPipelineRun(releasePlan, snapshot)
 			if err != nil {
+				if result, handledErr, handled := a.handlePipelineRunCreationError(err, metadata.FinalPipelineType); handled {
+					return result, handledErr
+				}
 				return controller.RequeueWithError(err)
 			}
 
@@ -2017,4 +2032,37 @@ func (a *adapter) getTaskRunLogs(taskRun *tektonv1.TaskRun) (string, error) {
 	}
 
 	return string(logs), nil
+}
+
+// handlePipelineRunCreationError inspects PipelineRun create errors and handles
+// known non-retriable validation failures without requeueing the Release.
+func (a *adapter) handlePipelineRunCreationError(err error, pipelineType metadata.PipelineType) (controller.OperationResult, error, bool) {
+	if !isNonRetriablePipelineRunCreationError(err) {
+		return controller.OperationResult{}, nil, false
+	}
+
+	patch := client.MergeFrom(a.release.DeepCopy())
+	message := fmt.Sprintf("Failed to create %s PipelineRun: %s", pipelineType.String(), err.Error())
+	if len(message) > maxConditionMessageLength {
+		message = message[:maxConditionMessageLength]
+	}
+	a.release.MarkReleaseFailed(message)
+
+	result, patchErr := controller.RequeueOnErrorOrContinue(a.client.Status().Patch(a.ctx, a.release, patch))
+	return result, patchErr, true
+}
+
+// isNonRetriablePipelineRunCreationError returns true when a PipelineRun create
+// failure is a permanent user/config error that should not be retried.
+func isNonRetriablePipelineRunCreationError(err error) bool {
+	if err == nil || loader.IsRetriable(err) {
+		return false
+	}
+
+	if errors.IsInvalid(err) || errors.IsBadRequest(err) || errors.IsForbidden(err) {
+		return true
+	}
+
+	errMessage := strings.ToLower(err.Error())
+	return strings.Contains(errMessage, "admission webhook") && strings.Contains(errMessage, "denied the request")
 }
